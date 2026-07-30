@@ -22,6 +22,9 @@ from app.ai.voice.agents.breeze_buddy.chat.client_context import (
     ClientContextTooLarge,
     compute_context_patch,
 )
+from app.ai.voice.agents.breeze_buddy.chat.evaluation import (
+    messages_for_ai_evaluation,
+)
 from app.ai.voice.agents.breeze_buddy.chat.history.block_codec import (
     filter_visible_blocks,
 )
@@ -366,6 +369,7 @@ async def create_chat_session_handler(
             session_id=db_session.id,
             role=ChatMessageRole.ASSISTANT,
             content=greeting_text,
+            sender_type="buddy",
         )
 
     return CreateChatSessionResponse(
@@ -1155,16 +1159,11 @@ async def get_chat_transcript_handler(
     """
     messages = await list_chat_messages_for_session(session.id)
     turn_metrics = await list_chat_turn_metrics_for_session(session.id)
-    evaluation_messages = [
-        {"role": m.role.value, "content": m.content}
-        for m in messages
-        if (m.sender_type or "") not in {"human", "system", "internal"}
-    ]
     return ChatTranscriptResponse(
         session_id=session.id,
         template_id=session.template_id,
         status=session.status,
         messages=_sanitize_messages_for_widget(messages),
-        evaluation_messages=evaluation_messages,
+        evaluation_messages=messages_for_ai_evaluation(messages),
         turn_metrics=turn_metrics,
     )

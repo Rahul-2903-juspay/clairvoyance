@@ -19,17 +19,20 @@ same session.
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request, UploadFile, status
+from fastapi.responses import StreamingResponse
 
 from app.ai.voice.agents.breeze_buddy.chat.client_context import (
     CLIENT_CONTEXT_KEY,
     ClientContextTooLarge,
     compute_context_patch,
 )
+from app.ai.voice.agents.breeze_buddy.chat.sse import SSEEvent, format_sse
 from app.ai.voice.agents.breeze_buddy.chat.turn_core import (
     negotiate_catalog,
     resolve_session_catalog_version,
@@ -76,8 +79,13 @@ from app.database.accessor.breeze_buddy.chat_session import (
     flip_chat_session_to_voice,
     get_agent_session_state,
     get_chat_session_by_id,
+    list_chat_messages_after_idx,
     list_chat_messages_for_session,
     merge_client_context,
+)
+from app.database.accessor.breeze_buddy.human_assist import (
+    get_active_human_assist_for_session,
+    get_human_assist_conversation,
 )
 from app.database.accessor.breeze_buddy.lead_call_tracker import (
     handle_lead_abort,
@@ -110,11 +118,27 @@ from app.schemas.breeze_buddy.chat import (
     UpdateWidgetContextResponse,
     WidgetChannel,
     WidgetIntentRequest,
+    WidgetSessionRollover,
     WidgetSessionStateResponse,
     WidgetSurfaceWire,
     WidgetTranscribeResponse,
     WidgetVoiceConnectResponse,
     WidgetVoiceEndResponse,
+)
+from app.schemas.breeze_buddy.human_assist import (
+    HumanAssistCloseReason,
+    HumanAssistStatus,
+    HumanAssistWidgetUpdates,
+)
+from app.services.human_assist import (
+    HumanAssistBusyError,
+    append_customer_human_assist_message,
+    close_active_human_assist_for_session,
+    touch_customer_human_assist,
+)
+from app.services.human_assist.events import (
+    human_assist_session_channel,
+    subscribe_human_assist_events,
 )
 from app.services.redis.locks import LockAcquireError, RedisLock
 
@@ -122,6 +146,8 @@ from app.services.redis.locks import LockAcquireError, RedisLock
 # two paths can serialise on the same key. Voice connect / end is fast
 # (DB writes + a Daily REST call), well under this.
 _SESSION_LOCK_TTL_SECONDS = 180
+_HUMAN_ASSIST_PRESENCE_REFRESH_SECONDS = 10.0
+_HUMAN_ASSIST_RECONCILE_SECONDS = 60.0
 
 # The Daily room itself expires after 1h (set in start_daily_session).
 # Surface that to the client so the embed knows when to reconnect.
@@ -297,7 +323,11 @@ async def create_widget_session_handler(
         # via metadata — same precedence rule as ``template_vars`` in
         # ``create_chat_session_handler``.
         metadata={
-            **(body.metadata or {}),
+            **{
+                key: value
+                for key, value in (body.metadata or {}).items()
+                if not key.startswith("human_assist")
+            },
             "widget": {
                 "widget_config_id": cfg.id,
                 "public_widget_key_prefix": cfg.public_widget_key[:6],
@@ -392,6 +422,60 @@ async def send_widget_message_handler(
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail=f"Widget session '{session_id}' has ended",
+        )
+    if session.current_channel == WidgetChannel.HUMAN:
+        conversation = await get_active_human_assist_for_session(session_id)
+        if conversation is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Human Assist routing is no longer active; refresh the session.",
+            )
+        try:
+            message = await append_customer_human_assist_message(
+                conversation, req.content.strip()
+            )
+        except HumanAssistBusyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "human_assist_busy",
+                    "message": str(exc),
+                },
+            ) from exc
+        if message is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Human Assist ticket state changed; refresh and retry.",
+            )
+        committed_message = message
+
+        async def _human_channel_ack():
+            yield format_sse(
+                SSEEvent(
+                    event="user_committed",
+                    data={
+                        "idx": committed_message.idx,
+                        "content": committed_message.content,
+                    },
+                )
+            )
+            yield format_sse(
+                SSEEvent(
+                    event="turn_end",
+                    data={
+                        "session_status": "ACTIVE",
+                        "current_channel": WidgetChannel.HUMAN.value,
+                    },
+                )
+            )
+
+        return StreamingResponse(
+            _human_channel_ack(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
     if session.current_channel != WidgetChannel.CHAT:
         raise HTTPException(
@@ -1154,6 +1238,17 @@ async def end_widget_session_handler(session_id: str, ctx: WidgetSessionContext)
 
     session = await load_chat_session_or_404(session_id)
     assert_widget_session_ownership(session, ctx)
+    if session.current_channel == WidgetChannel.HUMAN:
+        closed = await close_active_human_assist_for_session(
+            session_id,
+            reason=HumanAssistCloseReason.SESSION_ENDED,
+        )
+        if closed is None and await get_active_human_assist_for_session(session_id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Human Assist is processing another action; retry ending the chat.",
+            )
+        session = await load_chat_session_or_404(session_id)
     return await end_chat_session_handler(session_id, session)
 
 
@@ -1192,6 +1287,50 @@ async def get_widget_session_state_handler(
     # Unexpired pending HITL approvals so the embed can repaint approval
     # cards after a reload (lazy expiry — the accessor filters expires_at).
     pending_approvals = await list_pending_tool_approvals(session_id)
+    session_rollover: Optional[WidgetSessionRollover] = None
+    successor_id = (
+        session.metadata.get("human_assist_successor_session_id")
+        if isinstance(session.metadata, dict)
+        else None
+    )
+    if isinstance(successor_id, str):
+        successor = await get_chat_session_by_id(successor_id)
+        lineage = (
+            successor.metadata.get("human_assist_lineage")
+            if successor and isinstance(successor.metadata, dict)
+            else None
+        )
+        if (
+            successor is not None
+            and successor.status != ChatSessionStatus.ENDED
+            and isinstance(lineage, dict)
+            and lineage.get("previous_session_id") == session_id
+        ):
+            assert_widget_session_ownership(successor, ctx)
+            session_rollover = WidgetSessionRollover(
+                session_id=successor.id,
+                previous_session_id=session_id,
+                current_channel=successor.current_channel,
+                widget_token=mint_widget_token(
+                    widget_session_id=successor.id,
+                    widget_config_id=ctx.widget_config_id,
+                    ttl_minutes=DEFAULT_WIDGET_TOKEN_TTL_MINUTES,
+                ),
+                ttl_seconds=DEFAULT_WIDGET_TOKEN_TTL_MINUTES * 60,
+            )
+
+    # The persisted (negotiated-at-create) catalog version is the truth on
+    # resume; the flavor list is re-derived from the template so a config
+    # change between create and reload is reflected.
+    catalog_active = (
+        resolve_session_catalog_version(session.metadata) or CATALOG_VERSION
+    )
+    ui_flavors: List[str] = []
+    if catalog_active == CATALOG_VERSION_V2:
+        configurations = getattr(template, "configurations", None)
+        ui_cat = getattr(configurations, "ui_catalog", None) if configurations else None
+        enabled_groups = list(ui_cat.enabled_groups or []) if ui_cat is not None else []
+        ui_flavors = [g for g in enabled_groups if g in LAZY_GROUPS]
 
     # The persisted (negotiated-at-create) catalog version is the truth on
     # resume; the flavor list is re-derived from the template so a config
@@ -1233,4 +1372,108 @@ async def get_widget_session_state_handler(
         metadata=session.metadata or {},
         client_context=client_context,
         pending_approvals=pending_approvals,
+        session_rollover=session_rollover,
+    )
+
+
+async def stream_human_assist_updates_handler(
+    session_id: str,
+    after_idx: int,
+    request: Request,
+    ctx: WidgetSessionContext,
+) -> StreamingResponse:
+    """Stream committed native Human Assist changes without browser polling."""
+    session = await load_chat_session_or_404(session_id)
+    assert_widget_session_ownership(session, ctx)
+
+    async def _stream():
+        latest_idx = after_idx
+        conversation_id: Optional[str] = None
+        last_status: Optional[HumanAssistStatus] = None
+        last_channel: Optional[WidgetChannel] = None
+        last_presence_refresh = 0.0
+        last_reconcile = 0.0
+
+        async for event in subscribe_human_assist_events(
+            human_assist_session_channel(session_id)
+        ):
+            if await request.is_disconnected():
+                break
+
+            if event is not None:
+                event_session_id = event.get("chat_session_id")
+                if event.get("kind") != "ready" and event_session_id != session_id:
+                    continue
+
+            now = time.monotonic()
+            touched = None
+            if now - last_presence_refresh >= _HUMAN_ASSIST_PRESENCE_REFRESH_SECONDS:
+                touched = await touch_customer_human_assist(session_id)
+                last_presence_refresh = now
+                if touched is not None:
+                    conversation_id = touched.id
+
+            if (
+                event is None
+                and touched is not None
+                and now - last_reconcile < _HUMAN_ASSIST_RECONCILE_SECONDS
+            ):
+                yield ": keep-alive\n\n"
+                continue
+
+            if event is not None:
+                event_conversation_id = event.get("conversation_id")
+                if isinstance(event_conversation_id, str):
+                    conversation_id = event_conversation_id
+
+            refreshed = await load_chat_session_or_404(session_id)
+            assert_widget_session_ownership(refreshed, ctx)
+            conversation = (
+                touched or await get_human_assist_conversation(conversation_id)
+                if conversation_id
+                else await get_active_human_assist_for_session(session_id)
+            )
+            if conversation is not None:
+                conversation_id = conversation.id
+            messages = await list_chat_messages_after_idx(session_id, latest_idx)
+            sanitized = _sanitize_messages_for_widget(messages)
+            if sanitized:
+                latest_idx = max(message.idx for message in sanitized)
+            last_reconcile = now
+
+            updates = HumanAssistWidgetUpdates(
+                conversation_id=conversation.id if conversation else None,
+                status=conversation.status if conversation else None,
+                platform=conversation.platform if conversation else None,
+                current_channel=refreshed.current_channel,
+                messages=sanitized,
+            )
+            if (
+                event is None
+                and not sanitized
+                and updates.status == last_status
+                and updates.current_channel == last_channel
+            ):
+                yield ": keep-alive\n\n"
+                continue
+            last_status = updates.status
+            last_channel = updates.current_channel
+            yield format_sse(
+                SSEEvent(
+                    event="human_assist_update",
+                    data=updates.model_dump(mode="json"),
+                    id=str(latest_idx),
+                )
+            )
+            if refreshed.current_channel != WidgetChannel.HUMAN:
+                break
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )

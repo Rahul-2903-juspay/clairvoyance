@@ -44,6 +44,7 @@ from app.api.routers.breeze_buddy.chat import cancel_bus as chat_cancel_bus
 from app.core.background_tasks import BackgroundTaskScheduler
 from app.core.config.dynamic import (
     ENABLE_BACKGROUND_TASKS,
+    HUMAN_ASSIST_LIFECYCLE_LOOP_INTERVAL_SECONDS,
     KB_INGESTION_INTERVAL_SECONDS,
 )
 from app.core.config.static import (
@@ -60,6 +61,7 @@ from app.core.config.static import (
     CORS_ALLOWED_ORIGINS,
     ENABLE_DISPATCHER,
     ENABLE_DRAGONTTS_KILL_SWITCH,
+    ENABLE_HUMAN_ASSIST_LIFECYCLE_LOOP,
     ENABLE_SIGTERM_HANDLER,
     HOST,
     POD_ROLE,
@@ -70,6 +72,7 @@ from app.core.config.static import (
 from app.core.logger import logger
 from app.core.middleware.widget_cors_bypass import CustomWidgetCorsBypassMiddleware
 from app.database import close_db_pool, init_db_pool
+from app.services.human_assist import sweep_human_assist
 from app.services.knowledge_base import (
     process_pending_documents as process_pending_kb_documents,
 )
@@ -158,9 +161,21 @@ async def lifespan(_app: FastAPI):
     global _background_scheduler
     if await ENABLE_BACKGROUND_TASKS():
         try:
-            # Create scheduler instance with configurable loop interval
+            # The scheduler can only run a registered task as often as its
+            # outer loop wakes. Human Assist has customer-disconnect deadlines
+            # below the shared default, so use the tighter cadence when the
+            # sweep is enabled; Redis task locks still enforce each task's
+            # own registered interval.
+            loop_interval_seconds = BACKGROUND_TASKS_LOOP_INTERVAL_SECONDS
+            human_assist_lifecycle_interval = (
+                await HUMAN_ASSIST_LIFECYCLE_LOOP_INTERVAL_SECONDS()
+            )
+            if ENABLE_HUMAN_ASSIST_LIFECYCLE_LOOP:
+                loop_interval_seconds = min(
+                    loop_interval_seconds, human_assist_lifecycle_interval
+                )
             _background_scheduler = BackgroundTaskScheduler(
-                loop_interval_seconds=BACKGROUND_TASKS_LOOP_INTERVAL_SECONDS
+                loop_interval_seconds=loop_interval_seconds
             )
 
             # Initialize Langfuse tasks (if configured)
@@ -174,6 +189,15 @@ async def lifespan(_app: FastAPI):
                 func=end_idle_chat_sessions,
                 interval_seconds=CHAT_SESSION_END_TIMEOUT_LOOP_INTERVAL_SECONDS,
             )
+            # Static flag, not Redis-backed: dynamic config is shared by
+            # voice-agent and master pods alike, but this sweep must only
+            # run on the master (see app/core/config/static.py).
+            if ENABLE_HUMAN_ASSIST_LIFECYCLE_LOOP:
+                _background_scheduler.register_task(
+                    name="human_assist_lifecycle",
+                    func=sweep_human_assist,
+                    interval_seconds=human_assist_lifecycle_interval,
+                )
 
             # Knowledge base ingestion sweeper. Uploads kick processing
             # immediately in-process; this sweep catches kicks lost to pod

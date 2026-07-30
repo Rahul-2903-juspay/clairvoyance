@@ -13,9 +13,6 @@ Why each entry is disabled:
 
 - ``mute_stt`` / ``unmute_stt`` / ``play_audio_sound``: voice-only side
   effects (no STT or audio output exists in the chat pipeline).
-- ``warm_transfer`` / ``connect_to_live_agent``: chat-to-human handoff is
-  not implemented in v1; see ``docs/CHAT_MODE.md §15`` for the Phase 2
-  plan.
 - ``connect_to_agent``: agent-to-agent transfer rebuilds a voice pipeline
   (new STT/LLM/TTS). Chat agents are constructed-and-discarded per turn, so a
   "transfer" there is just changing the session's template id — a different,
@@ -40,8 +37,6 @@ CHAT_DISABLED_NAMES: frozenset[str] = frozenset(
         "mute_stt",
         "unmute_stt",
         "play_audio_sound",
-        "warm_transfer",
-        "connect_to_live_agent",
         "connect_to_agent",
         "end_conversation",
         "hold_and_consult",

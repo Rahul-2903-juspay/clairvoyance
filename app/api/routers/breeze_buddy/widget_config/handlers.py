@@ -18,6 +18,7 @@ from fastapi import HTTPException, status
 
 from app.api.routers.breeze_buddy.templates.rbac import validate_template_access
 from app.core.logger import logger
+from app.core.security.authorization import require_role
 from app.database.accessor import get_template_by_id
 from app.database.accessor.breeze_buddy.widget_config import (
     create_widget_config,
@@ -27,7 +28,7 @@ from app.database.accessor.breeze_buddy.widget_config import (
     list_widget_configs,
     update_widget_config,
 )
-from app.schemas import UserInfo
+from app.schemas import UserInfo, UserRole
 from app.schemas.breeze_buddy.widget_config import (
     DeleteWidgetConfigResponse,
     WidgetConfigCreate,
@@ -35,11 +36,13 @@ from app.schemas.breeze_buddy.widget_config import (
     WidgetConfigResponse,
     WidgetConfigUpdate,
 )
+from app.services.human_assist.platforms import is_platform_registered
 
 # 32 url-safe bytes → ~43 chars; well inside the column's varchar(128)
 # and gives ~256 bits of entropy. Matches what major SaaS vendors hand
 # out for embed keys.
 _PUBLIC_KEY_NBYTES = 32
+_CONFIG_WRITE_ROLES = [UserRole.ADMIN, UserRole.RESELLER, UserRole.MERCHANT]
 
 
 def _generate_public_widget_key() -> str:
@@ -50,6 +53,7 @@ def _generate_public_widget_key() -> str:
 async def create_widget_config_handler(
     body: WidgetConfigCreate, current_user: UserInfo
 ) -> WidgetConfigResponse:
+    require_role(current_user, _CONFIG_WRITE_ROLES)
     logger.info(
         f"User {current_user.username} (role: {current_user.role}) creating "
         f"widget_config for reseller={body.reseller_id} merchant={body.merchant_id}"
@@ -100,6 +104,15 @@ async def create_widget_config_handler(
             ),
         )
 
+    if not is_platform_registered(body.human_assist_platform):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Human Assist platform '{body.human_assist_platform}' "
+                "is not registered"
+            ),
+        )
+
     public_widget_key = _generate_public_widget_key()
     created = await create_widget_config(
         reseller_id=body.reseller_id,
@@ -111,6 +124,8 @@ async def create_widget_config_handler(
         max_messages_per_ip_hour=body.max_messages_per_ip_hour,
         max_concurrent_per_ip=body.max_concurrent_per_ip,
         max_voice_sessions_per_ip_hour=body.max_voice_sessions_per_ip_hour,
+        human_assist_enabled=body.human_assist_enabled,
+        human_assist_platform=body.human_assist_platform,
         active=body.active,
     )
     if not created:
@@ -197,6 +212,7 @@ async def update_widget_config_handler(
     body: WidgetConfigUpdate,
     current_user: UserInfo,
 ) -> WidgetConfigResponse:
+    require_role(current_user, _CONFIG_WRITE_ROLES)
     cfg = await get_widget_config_by_id(widget_config_id)
     if cfg is None:
         raise HTTPException(
@@ -231,6 +247,17 @@ async def update_widget_config_handler(
                 detail="Template does not belong to this widget's merchant",
             )
 
+    if body.human_assist_platform is not None and not is_platform_registered(
+        body.human_assist_platform
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Human Assist platform '{body.human_assist_platform}' "
+                "is not registered"
+            ),
+        )
+
     updated = await update_widget_config(
         widget_config_id,
         template_id=body.template_id,
@@ -239,6 +266,8 @@ async def update_widget_config_handler(
         max_messages_per_ip_hour=body.max_messages_per_ip_hour,
         max_concurrent_per_ip=body.max_concurrent_per_ip,
         max_voice_sessions_per_ip_hour=body.max_voice_sessions_per_ip_hour,
+        human_assist_enabled=body.human_assist_enabled,
+        human_assist_platform=body.human_assist_platform,
         active=body.active,
     )
     if updated is None:

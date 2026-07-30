@@ -22,7 +22,16 @@ Origin + per-IP rate limit. All other routes use the session-bound
 ``widget_token`` minted at create-time.
 """
 
-from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 
 from app.api.routers.breeze_buddy.widget_common import options_cors_response
 from app.api.security.breeze_buddy.widget_token import (
@@ -52,6 +61,7 @@ from .handlers import (
     get_widget_session_state_handler,
     send_widget_intent_handler,
     send_widget_message_handler,
+    stream_human_assist_updates_handler,
     transcribe_widget_audio_handler,
     update_widget_context_handler,
     voice_connect_handler,
@@ -118,6 +128,11 @@ async def widget_voice_end_preflight(session_id: str) -> Response:
 
 @router.options("/session/{session_id}/end")
 async def widget_end_preflight(session_id: str) -> Response:
+    return options_cors_response()
+
+
+@router.options("/session/{session_id}/human-assist/stream")
+async def widget_human_assist_stream_preflight(session_id: str) -> Response:
     return options_cors_response()
 
 
@@ -299,6 +314,24 @@ async def get_widget_session_state(
     ctx: WidgetSessionContext = Depends(require_widget_session),
 ) -> WidgetSessionStateResponse:
     return await get_widget_session_state_handler(session_id, ctx)
+
+
+@router.get(
+    "/session/{session_id}/human-assist/stream",
+    summary="Stream native Human Assist messages and routing state",
+)
+async def stream_human_assist_updates(
+    session_id: str,
+    request: Request,
+    after_idx: int = Query(default=-1, ge=-1),
+    ctx: WidgetSessionContext = Depends(require_widget_session),
+):
+    return await stream_human_assist_updates_handler(
+        session_id,
+        after_idx,
+        request,
+        ctx,
+    )
 
 
 __all__ = ["router"]

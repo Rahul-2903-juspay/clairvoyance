@@ -189,6 +189,12 @@ class ChatAgent(
         self.lead = None
         self.call_sid: Optional[str] = None
         self.aiohttp_session: Optional[Any] = None
+        # Ephemeral client-only handoff data. The Human Assist handler may
+        # set this when a repeat request rolls the widget onto a new chat
+        # session. It is consumed into the dedicated SSE event immediately
+        # after tool dispatch and never enters tool results, traversal
+        # state, or Postgres.
+        self._human_assist_session_rollover_event: Optional[Dict[str, Any]] = None
         # Per-turn MCP client pool — one MCPClient per server, opened on
         # the first tool call and reused for every subsequent call within
         # the same turn. Closed in run_turn's finally so the StreamableHTTP
@@ -478,6 +484,7 @@ class ChatAgent(
                 role=ChatMessageRole.USER,
                 content=user_content,
                 content_blocks=plain_text_blocks(user_content),
+                sender_type="customer",
             )
             yield SSEEvent(
                 event="user_committed",

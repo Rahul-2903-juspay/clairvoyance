@@ -170,6 +170,7 @@ async def claim_tool_approval(
             content_blocks=tool_results_to_user_blocks(
                 [(tool_call_id, synthetic_result)]
             ),
+            sender_type="internal",
         )
 
     # Lazily expire the OTHER pending rows past their TTL (persists their
@@ -238,6 +239,7 @@ async def resolve_dangling_approvals(
         role=ChatMessageRole.USER,
         content=None,
         content_blocks=tool_results_to_user_blocks(pairs),
+        sender_type="internal",
     )
     logger.info(
         f"[approval] Resolved {len(claimed)} dangling approval(s) as "
@@ -279,6 +281,7 @@ async def terminate_pending_approvals(session_id: str) -> List[ToolApproval]:
         role=ChatMessageRole.USER,
         content=None,
         content_blocks=tool_results_to_user_blocks(pairs),
+        sender_type="internal",
     )
     logger.info(
         f"[approval] Terminated {len(claimed)} pending approval(s) on session "

@@ -352,6 +352,7 @@ class ApprovalTurnMixin:
             content_blocks=tool_results_to_user_blocks(
                 [(tool_call_id, result_payload)]
             ),
+            sender_type="internal",
         )
 
     async def _prepare_kb_message_for_resume(

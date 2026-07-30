@@ -23,6 +23,7 @@ from app.api.routers.breeze_buddy.demo import router as demo_router
 
 # DragonTTS kill switch (admin-only one-directional TTS failover)
 from app.api.routers.breeze_buddy.dragontts import router as dragontts_router
+from app.api.routers.breeze_buddy.human_assist import router as human_assist_router
 
 # Knowledge base (RAG) management: KBs, documents, retrieval testing
 from app.api.routers.breeze_buddy.knowledge_base import router as knowledge_base_router
@@ -152,6 +153,7 @@ router.include_router(daily_router, prefix="", tags=["daily"])
 
 # Chat (text-mode sessions: REST + SSE, no STT/TTS/VAD)
 router.include_router(chat_router, prefix="", tags=["chat"])
+router.include_router(human_assist_router, prefix="", tags=["human-assist"])
 
 # Widget public mode (CHAT_MODE.md §14)
 # - widget_config: per-merchant config (admin/reseller-scoped CRUD)

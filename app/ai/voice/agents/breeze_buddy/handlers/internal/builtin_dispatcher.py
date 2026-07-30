@@ -80,7 +80,9 @@ async def _speak_and_wait(context: TemplateContext, message: str) -> None:
     - add_event_handler() APPENDS handlers (does not replace)
     - add_reached_downstream_filter() ADDS to the existing filter set
     """
-    task = context.task
+    task = getattr(context.bot, "task", None)
+    if task is None:
+        return
     bot_started = False
     bot_stopped_event = asyncio.Event()
 

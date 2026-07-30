@@ -61,7 +61,65 @@ from app.schemas.breeze_buddy.chat import (
     ChatMessageRole,
     ChatSessionStatus,
     ToolApprovalStatus,
+    WidgetChannel,
 )
+
+
+def _history_row_for_llm(row: Any) -> Dict[str, Any]:
+    """Preserve human replies for Buddy context without misattributing them.
+
+    chat_message keeps human replies as role=assistant because that is their
+    customer-facing role. On Buddy replay, prefix the visible text so the
+    model understands that another agent authored it.
+    """
+    content = row.content
+    blocks = row.content_blocks
+    sender_type = row.sender_type
+    if sender_type in {"human", "system"}:
+        marker = (
+            "[Human support agent message] "
+            if sender_type == "human"
+            else "[Human Assist system status] "
+        )
+        content = f"{marker}{content}" if content else content
+        if blocks:
+            blocks = [dict(block) for block in blocks]
+            for block in blocks:
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    block["text"] = marker + block["text"]
+                    break
+    return {
+        "role": row.role.value,
+        "content": content,
+        "content_blocks": blocks,
+    }
+
+
+def _should_replay_history_row(row: Any) -> bool:
+    """Keep Human Assist transcript messages, but not its lifecycle notices.
+
+    The four notification call sites (ticket requested, claimed, closed, and
+    the rollover continuity summary) are the only paths that ever tag a
+    message ``sender_type`` "buddy" or "system" — every genuine conversational
+    row (customer/human via a platform adapter, or regular non-Live-Assist
+    Buddy chat) is "customer", "human", or ``None``. No separate marker
+    needed.
+
+    The rollover continuity summary is the one carve-out: unlike the other
+    three (ephemeral UI notices with no lasting value once read), it IS
+    Buddy's own prior-session context, and must survive into the new
+    session's LLM replay so Buddy still knows the customer's history once
+    the channel flips back from HUMAN to CHAT. It's deterministically the
+    idx=0 row of a rolled-over session (see
+    ``rollover_human_assist_session_query``), so gating on idx is sufficient
+    — no separate marker needed. It stays invisible to the customer either
+    way: its content_block is tagged ``visibility=internal``, and the
+    widget-facing delivery log excludes idx=0 on lineage sessions outright.
+    """
+    is_notification = row.sender_type in {"buddy", "system"} and row.idx != 0
+    return row.role in (ChatMessageRole.USER, ChatMessageRole.ASSISTANT) and not (
+        is_notification
+    )
 
 
 def resolve_llm_configuration(template: TemplateModel) -> Any:
@@ -198,6 +256,22 @@ async def run_chat_turn(
         )
         yield SSEEvent(event="turn_end", data={"session_status": "FAILED"})
         return
+    if session.current_channel == WidgetChannel.HUMAN:
+        yield SSEEvent(
+            event="error",
+            data={
+                "code": "human_assist_active",
+                "message": "A human agent is handling this conversation.",
+            },
+        )
+        yield SSEEvent(
+            event="turn_end",
+            data={
+                "session_status": "ACTIVE",
+                "current_channel": WidgetChannel.HUMAN.value,
+            },
+        )
+        return
 
     template = await get_template_by_id_cached(session.template_id)
     if template is None:
@@ -241,13 +315,9 @@ async def run_chat_turn(
     # (cart_id, etc.) verbatim — this is what makes voice resume "just work".
     history: list = blocks_to_llm_context_messages(
         [
-            {
-                "role": row.role.value,
-                "content": row.content,
-                "content_blocks": row.content_blocks,
-            }
+            _history_row_for_llm(row)
             for row in history_rows
-            if row.role in (ChatMessageRole.USER, ChatMessageRole.ASSISTANT)
+            if _should_replay_history_row(row)
         ]
     )
     # Heal any unmatched tool_use (decided-but-lost rows) → synthetic error
@@ -318,6 +388,16 @@ async def run_chat_approval_continuation(
         )
         yield SSEEvent(event="turn_end", data={"session_status": "FAILED"})
         return
+    if session.current_channel == WidgetChannel.HUMAN:
+        yield SSEEvent(
+            event="error",
+            data={
+                "code": "human_assist_active",
+                "message": "A human agent is handling this conversation.",
+            },
+        )
+        yield SSEEvent(event="turn_end", data={"session_status": "ACTIVE"})
+        return
     template = await get_template_by_id_cached(session.template_id)
     if template is None:
         yield SSEEvent(
@@ -331,13 +411,9 @@ async def run_chat_approval_continuation(
     history_rows = await list_chat_messages_for_session(session_id, limit=history_limit)
     history: list = blocks_to_llm_context_messages(
         [
-            {
-                "role": row.role.value,
-                "content": row.content,
-                "content_blocks": row.content_blocks,
-            }
+            _history_row_for_llm(row)
             for row in history_rows
-            if row.role in (ChatMessageRole.USER, ChatMessageRole.ASSISTANT)
+            if _should_replay_history_row(row)
         ]
     )
     # The claimed call (answered in-turn by run_approval_turn) and the

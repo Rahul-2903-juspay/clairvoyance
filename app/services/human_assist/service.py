@@ -17,14 +17,14 @@ from pipecat.processors.aggregators.llm_context import (
     LLMContextMessage,
 )
 
-from app.ai.voice.agents.breeze_buddy.chat import llm_driver
-from app.ai.voice.agents.breeze_buddy.chat.block_codec import (
-    internal_text_block,
-    plain_text_blocks,
-)
 from app.ai.voice.agents.breeze_buddy.chat.evaluation import (
     messages_for_ai_evaluation,
 )
+from app.ai.voice.agents.breeze_buddy.chat.history.block_codec import (
+    internal_text_block,
+    plain_text_blocks,
+)
+from app.ai.voice.agents.breeze_buddy.chat.llm import driver as llm_driver
 from app.ai.voice.agents.breeze_buddy.llm import get_llm_service
 from app.ai.voice.agents.breeze_buddy.template.cache import (
     get_template_by_id_cached,

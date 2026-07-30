@@ -38,10 +38,43 @@ from app.ai.voice.agents.breeze_buddy.utils.transport.websockets import (
     close_websocket_safely,
 )
 from app.ai.voice.agents.breeze_buddy.utils.warm_transfer import set_transfer_flag
+from app.api.security.breeze_buddy.widget_token import (
+    DEFAULT_WIDGET_TOKEN_TTL_MINUTES,
+    mint_widget_token,
+)
 from app.core.config.static import APP_BASE_URL
 from app.core.logger import logger
 from app.database.accessor import get_telephony_number_by_id
 from app.schemas import CallProvider
+from app.services.human_assist import request_human_assist
+from app.services.human_assist.platforms import HumanAssistPlatformError
+
+
+def _human_assist_rollover_payload(
+    previous_session_id: str,
+    conversation: Any,
+) -> Optional[Dict[str, Any]]:
+    """Return client-only credentials when a repeat handoff starts a new chat."""
+    next_session_id = getattr(conversation, "chat_session_id", None)
+    widget_config_id = getattr(conversation, "widget_config_id", None)
+    if (
+        not isinstance(next_session_id, str)
+        or next_session_id == previous_session_id
+        or not isinstance(widget_config_id, str)
+    ):
+        return None
+    status_value = getattr(getattr(conversation, "status", None), "value", None)
+    return {
+        "session_id": next_session_id,
+        "previous_session_id": previous_session_id,
+        "current_channel": ("HUMAN" if status_value in {"PENDING", "OPEN"} else "CHAT"),
+        "widget_token": mint_widget_token(
+            widget_session_id=next_session_id,
+            widget_config_id=widget_config_id,
+            ttl_minutes=DEFAULT_WIDGET_TOKEN_TTL_MINUTES,
+        ),
+        "ttl_seconds": DEFAULT_WIDGET_TOKEN_TTL_MINUTES * 60,
+    }
 
 
 async def connect_to_live_agent(
@@ -63,7 +96,77 @@ async def connect_to_live_agent(
 
     Returns:
         Dict with status, reason, message, conference_id
+
+    In chat mode this requests Human Assist. Voice mode retains the existing
+    warm-transfer behavior.
     """
+    chat_session_id = getattr(context.bot, "session_id", None)
+    if chat_session_id and context.lead is None:
+        try:
+            conversation = await request_human_assist(
+                chat_session_id,
+                metadata={"tool_name": "connect_to_live_agent"},
+            )
+        except HumanAssistPlatformError as exc:
+            result: Dict[str, Any] = {
+                "status": "failed",
+                "reason": "human_assist_platform_unavailable",
+                "message": (
+                    "The selected human-support platform is unavailable. "
+                    "Continue helping the customer with Buddy and suggest "
+                    "trying Human Assist again later."
+                ),
+            }
+            failed_conversation = exc.conversation
+            rollover = _human_assist_rollover_payload(
+                chat_session_id,
+                failed_conversation,
+            )
+            if rollover and failed_conversation is not None:
+                setattr(
+                    context.bot,
+                    "_human_assist_session_rollover_event",
+                    rollover,
+                )
+                result.update(
+                    {
+                        "status": failed_conversation.status.value.lower(),
+                        "human_assist": True,
+                        "conversation_id": failed_conversation.id,
+                        "platform": failed_conversation.platform,
+                    }
+                )
+            return result
+        if conversation is None:
+            return {
+                "status": "failed",
+                "reason": "human_assist_disabled",
+                "message": (
+                    "Human Assist is not enabled. Continue "
+                    "helping the customer with Buddy."
+                ),
+            }
+        result = {
+            "status": "pending",
+            "human_assist": True,
+            "conversation_id": conversation.id,
+            "platform": conversation.platform,
+            "claim_deadline_at": conversation.claim_deadline_at.isoformat(),
+            "message": (
+                "A human support ticket is waiting in the merchant Inbox. "
+                "The customer-facing wait message has already been sent; "
+                "do not repeat it."
+            ),
+        }
+        rollover = _human_assist_rollover_payload(chat_session_id, conversation)
+        if rollover:
+            setattr(
+                context.bot,
+                "_human_assist_session_rollover_event",
+                rollover,
+            )
+        return result
+
     logger.info(f"Transfer called for {context.call_sid}")
 
     # Fetch telephony number from database

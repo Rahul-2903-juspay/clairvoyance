@@ -114,8 +114,8 @@ class CycleLoopMixin:
         """The LLM ↔ tool loop for one turn (shared by ``run_turn`` and the
         continuation of ``run_approval_turn``). ``context`` must already be
         seeded; this loop drives LLM cycles, dispatches ungated tool calls,
-        and ends the turn early (``turn_end {awaiting_approval}``) when the
-        LLM calls an approval-gated function.
+        and ends the turn early when Human Assist owns the customer reply or
+        the LLM calls an approval-gated function.
 
         ``first_cycle_fast`` grades cycle 1 down to minimal thinking (see
         the override at the stream call). Approval continuations pass False
@@ -663,6 +663,7 @@ class CycleLoopMixin:
                     # which also lets a later same-turn ProductGrid merge
                     # mutate the pending op before anything hits the DB.
                     ui_blocks=self._row_ui_blocks(turn_ui_ops, include_tool_ops=False),
+                    sender_type="buddy",
                 )
                 gate_assistant_idx = gate_row.idx if gate_row else None
                 if visible_text and not (cycle_answers or self._internal_turn):
@@ -735,6 +736,12 @@ class CycleLoopMixin:
                 self._suppress_extra_prose = False
 
             next_node: Optional[Dict[str, Any]] = None
+            human_assist_owns_customer_reply = False
+            # Keyed by tool_call_id: the ephemeral session-rollover payload
+            # (if any) the Human Assist handler stashed during THIS call's
+            # dispatch. Consumed once, right when the matching result is
+            # examined below, so it never rides along on the tool result.
+            human_assist_rollover_by_call: Dict[str, Optional[Dict[str, Any]]] = {}
             tool_result_pairs: List[Tuple[str, Any]] = []
             # (call, result) in ORIGINAL call order — post-dispatch
             # bookkeeping (binding store, context messages, reducers) is
@@ -832,6 +839,13 @@ class CycleLoopMixin:
                     result_payload, transition_node = await self._dispatch_tool_call(
                         call, node, global_funcs, injected_args=injected_args
                     )
+                    # Session-rollover credentials bypass the tool result so
+                    # the builtin traversal recorder, LLM, and chat
+                    # persistence never observe them.
+                    human_assist_rollover_by_call[call.tool_call_id] = (
+                        self._human_assist_session_rollover_event
+                    )
+                    self._human_assist_session_rollover_event = None
                     result_payload = self._verify_result(
                         call.function_name, injected_args, result_payload
                     )
@@ -915,6 +929,33 @@ class CycleLoopMixin:
                     reducers=reducer_rules,
                 )
                 tool_result_pairs.append((call.tool_call_id, result_payload))
+                if (
+                    isinstance(result_payload, dict)
+                    and result_payload.get("human_assist") is True
+                ):
+                    human_assist_rollover = human_assist_rollover_by_call.get(
+                        call.tool_call_id
+                    )
+                    if human_assist_rollover:
+                        yield SSEEvent(
+                            event="session_rollover",
+                            data=human_assist_rollover,
+                        )
+                    human_assist_data = {
+                        "status": result_payload.get("status", "pending"),
+                        "conversation_id": result_payload.get("conversation_id"),
+                        "platform": result_payload.get("platform"),
+                        "claim_deadline_at": result_payload.get("claim_deadline_at"),
+                    }
+                    yield SSEEvent(
+                        event="human_assist_status",
+                        data=human_assist_data,
+                    )
+                    # Human Assist persists the customer-facing wait/failure
+                    # message itself. Do not run another LLM cycle and
+                    # create a second Buddy reply for the same handoff
+                    # request.
+                    human_assist_owns_customer_reply = True
                 if transition_node is not None and next_node is None:
                     next_node = transition_node
             # Belt-and-braces: side effects appended by any dispatch path
@@ -932,6 +973,7 @@ class CycleLoopMixin:
                     role=ChatMessageRole.USER,
                     content=None,
                     content_blocks=tool_results_to_user_blocks(tool_result_pairs),
+                    sender_type="internal",
                 )
             # Persist ONLY the keys this turn's reducers changed vs the state
             # loaded at turn start (never the whole row, never the client-
@@ -952,6 +994,24 @@ class CycleLoopMixin:
                 node_name = cast(str, node.get("name") or node_name)
                 self._apply_node_transition(context, node, global_funcs)
                 yield SSEEvent(event="node_transition", data={"to": node_name})
+
+            if human_assist_owns_customer_reply:
+                await update_chat_session_after_turn(
+                    session_id=self.session_id, current_node=node_name or None
+                )
+                # Discard any incomplete UI marker carry; Human Assist
+                # already supplied the only customer-facing response for
+                # this turn.
+                for _ in self._ui_extractor.flush():
+                    pass
+                yield SSEEvent(
+                    event="turn_end",
+                    data={
+                        "session_status": "ACTIVE",
+                        "assistant_idx": gate_assistant_idx,
+                    },
+                )
+                return
 
             if gated_calls:
                 # Order is load-bearing: the ungated results + agent state
@@ -1104,6 +1164,7 @@ class CycleLoopMixin:
                 content=None if self._internal_turn else (visible_text or None),
                 content_blocks=persisted_blocks,
                 ui_blocks=final_ui_blocks,
+                sender_type="buddy",
             )
             final_assistant_idx = stored.idx if stored else None
             # Only emit a bubble when there's actual visible prose. A

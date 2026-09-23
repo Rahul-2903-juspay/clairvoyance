@@ -34,4 +34,16 @@ EXTRACTORS: Dict[str, Extractor] = {
 }
 DEFAULT_EXTRACTOR: Extractor = flat.extract
 
-__all__ = ["EXTRACTORS", "DEFAULT_EXTRACTOR", "Extractor", "SPEC_MODULES"]
+# The sources whose letters are our own call reports: buddy's telephony
+# mirror (breeze_buddy/crm_mirror.py), which writes call.attempted,
+# call.completed and call.inbound about calls we placed or took. They carry a
+# call's outcome, never the merchant's facts.
+CALL_REPORT_SOURCES = frozenset({"telephony"})
+
+__all__ = [
+    "CALL_REPORT_SOURCES",
+    "EXTRACTORS",
+    "DEFAULT_EXTRACTOR",
+    "Extractor",
+    "SPEC_MODULES",
+]

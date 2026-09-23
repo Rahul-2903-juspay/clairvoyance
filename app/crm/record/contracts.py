@@ -22,6 +22,7 @@ from app.crm.record.catalog import (
     topic_counts,
 )
 from app.crm.record.events import customer_has_event, event_topics
+from app.crm.record.extractors import CALL_REPORT_SOURCES
 from app.crm.record.extractors.engine import field_value, list_values, variable_name
 from app.crm.record.ingest import record_event
 from app.crm.record.ingress import IngressSpec, register_ingress
@@ -53,4 +54,6 @@ __all__ = [
     "list_values",
     "topic_counts",
     "variable_name",
+    # The sources whose letters are our own call reports, not a producer's.
+    "CALL_REPORT_SOURCES",
 ]
